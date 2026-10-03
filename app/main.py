@@ -49,11 +49,26 @@
 - 收录范围内存在失效引用（目标已不在草稿）时整份拒绝（409），列出来源稳定身份与缺失
   目标；范围外的失效引用不阻止摘录，也不影响整稿导出的既有规则。
 - 返回摘录文本及各条的稳定身份、草稿编号（当前显示编号）与摘录编号。
+
+校稿存档（``GET /api/archive`` / ``PUT /api/archive``）：
+- 服务端用 SQLite 保存**一个共享槽**的完整快照：不可变原稿基线、当前顺序、内部正文
+  （``order_ids`` / ``clauses``，内部形态 ``[[c3]]``）与已用身份上界（``id_counter``）；
+  不含勾选、编辑中正文或拆分选择等临时状态。数据库文件自动创建（表不存在时自动建表），
+  容器经数据卷持久化，刷新页面或重建容器后均可恢复继续校订。
+- 读取返回版本与快照：空槽版本为 0、快照为 null。
+- 保存携带最近读取或保存成功得到的版本：仅与槽内当前版本一致时整份写入并加 1；
+  不一致返回 409（附当前版本），旧存档保留。版本检查与写入在同一事务内完成。
+- 快照沿用草稿校验：基线与现稿均须通过既有状态校验，身份上界须覆盖基线、现稿及
+  失效引用中出现的全部身份号（恢复后继续拆分 / 复制不会复用旧身份）；
+  非法快照（422）或写入失败（500）时旧存档一律保留。
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import sqlite3
 from collections import deque
 from pathlib import Path
 
@@ -136,6 +151,20 @@ class ReferrersIn(StateIn):
 
 class ExcerptIn(StateIn):
     selected_ids: list[str]  # 要收入摘录的条款身份；自动并入其直接、间接引用的全部现存条款
+
+
+class ArchiveSnapshotIn(BaseModel):
+    # 共享槽的完整快照：不可变原稿基线 + 当前草稿（顺序与内部正文）+ 已用身份上界；
+    # 不含勾选、编辑中正文或拆分选择等临时状态
+    baseline: StateIn
+    order_ids: list[str]
+    clauses: list[ClauseIn]
+    id_counter: int  # 已用身份上界：须覆盖基线、现稿及失效引用中的身份号
+
+
+class ArchivePutIn(BaseModel):
+    version: int  # 最近读取或保存成功得到的版本；空槽为 0
+    snapshot: ArchiveSnapshotIn
 
 
 # --------------------------------------------------------------------------- #
@@ -915,6 +944,128 @@ def excerpt_doc(payload: ExcerptIn):
             }
         )
     return {"text": "\n".join(lines), "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# 校稿存档（SQLite 单槽持久化）
+# --------------------------------------------------------------------------- #
+# 数据库路径：默认工作目录下 data/archive.db（容器内为 /app/data，由 Compose 数据卷持久化）；
+# 可用环境变量 ARCHIVE_DB_PATH 覆盖（测试借此隔离）
+DB_PATH = Path(os.environ.get("ARCHIVE_DB_PATH", "data/archive.db"))
+
+
+def _connect() -> sqlite3.Connection:
+    """打开存档数据库连接；目录与表不存在时自动创建（空库即空槽）。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS archive (
+            slot INTEGER PRIMARY KEY CHECK (slot = 1),
+            version INTEGER NOT NULL,
+            snapshot TEXT NOT NULL
+        )
+        """
+    )
+    return conn
+
+
+def _validate_archive_snapshot(snap: ArchiveSnapshotIn) -> None:
+    """校验存档快照：基线与现稿沿用草稿校验，身份上界覆盖全部已用身份号。"""
+    _validate_state(snap.baseline.order_ids, snap.baseline.clauses)
+    _validate_state(snap.order_ids, snap.clauses)
+    if snap.id_counter < 0:
+        raise HTTPException(422, detail={"errors": ["身份上界非法：须为不小于 0 的整数"]})
+    # 已用身份号 = 基线与现稿的条款身份 + 两份正文中全部引用（含失效引用）的身份；
+    # 上界必须覆盖它们，恢复后继续拆分 / 复制才不会复用旧身份、复活失效引用
+    used = 0
+    for clause_id in [
+        *snap.order_ids,
+        *snap.baseline.order_ids,
+        *(c.id for c in snap.clauses),
+        *(c.id for c in snap.baseline.clauses),
+    ]:
+        used = max(used, int(clause_id[1:]))  # 形态已由 _validate_state 保证
+    for clause in [*snap.clauses, *snap.baseline.clauses]:
+        for m in MARKER_RE.finditer(clause.body):
+            used = max(used, int(m.group(1)[1:]))
+    if snap.id_counter < used:
+        raise HTTPException(
+            422,
+            detail={
+                "errors": [
+                    f"身份上界 {snap.id_counter} 未覆盖草稿已用身份号 {used}"
+                    "（基线、现稿及失效引用中的身份均须覆盖）"
+                ]
+            },
+        )
+
+
+@app.get("/api/archive")
+def read_archive():
+    """读取共享槽存档：返回版本与完整快照；空槽版本为 0、快照为 null。"""
+    try:
+        conn = _connect()
+        try:
+            row = conn.execute("SELECT version, snapshot FROM archive WHERE slot = 1").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise HTTPException(500, detail={"errors": [f"读取存档失败：{exc}"]})
+    if row is None:
+        return {"version": 0, "snapshot": None}
+    return {"version": row[0], "snapshot": json.loads(row[1])}
+
+
+@app.put("/api/archive")
+def write_archive(payload: ArchivePutIn):
+    """整份写入共享槽存档（乐观并发）。
+
+    - 快照先校验：基线与现稿沿用草稿校验，身份上界须覆盖基线、现稿及失效引用中的
+      身份号；非法快照 422，旧存档保留。
+    - 仅当所携版本与槽内当前版本一致时整份写入并加 1；不一致返回 409（附当前版本），
+      旧存档保留。版本检查与写入在同一事务（BEGIN IMMEDIATE）内完成，并发保存只有
+      一个能推进版本。
+    - 写入失败（如磁盘错误）回滚事务，旧存档保留。
+    """
+    if payload.version < 0:
+        raise HTTPException(422, detail={"errors": ["版本号非法：须为不小于 0 的整数"]})
+    _validate_archive_snapshot(payload.snapshot)
+    snapshot_json = json.dumps(payload.snapshot.model_dump(), ensure_ascii=False)
+    try:
+        conn = _connect()
+    except sqlite3.Error as exc:
+        raise HTTPException(500, detail={"errors": [f"打开存档数据库失败，旧存档已保留：{exc}"]})
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT version FROM archive WHERE slot = 1").fetchone()
+        current = row[0] if row else 0
+        if current != payload.version:
+            conn.rollback()
+            raise HTTPException(
+                409,
+                detail={
+                    "errors": [
+                        f"存档版本冲突：服务端当前版本为 {current}，本次保存基于版本 "
+                        f"{payload.version}；旧存档已保留，请读取最新版本后再保存"
+                    ],
+                    "version": current,
+                },
+            )
+        conn.execute(
+            "INSERT INTO archive (slot, version, snapshot) VALUES (1, ?, ?) "
+            "ON CONFLICT(slot) DO UPDATE SET version = excluded.version, snapshot = excluded.snapshot",
+            (current + 1, snapshot_json),
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+    except sqlite3.Error as exc:
+        conn.rollback()
+        raise HTTPException(500, detail={"errors": [f"写入存档失败，旧存档已保留：{exc}"]})
+    finally:
+        conn.close()
+    return {"version": current + 1}
 
 
 # --------------------------------------------------------------------------- #

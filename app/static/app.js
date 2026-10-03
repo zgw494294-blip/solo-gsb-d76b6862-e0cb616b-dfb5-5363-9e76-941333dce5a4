@@ -38,6 +38,13 @@ const state = {
   excerptData: null, // 最近一次与当前草稿+勾选一致的 /api/excerpt 响应；改稿 / 切换勾选 / 重新导入立即置空
   excerptError: null, // 最近一次摘录导出失败的错误信息（数组）；成功一次或清空后复位
   excerpting: false, // /api/excerpt 在途（期间忽略重复提交）
+  archiveVersion: null, // 最近读取或保存成功得到的服务端存档版本；null 表示尚未读取 / 保存过
+  archiveDirty: false, // 草稿是否有未存档改动：任何改稿置真，保存成功（期间未再改）或恢复后复位
+  archiving: false, // PUT /api/archive 在途（期间忽略重复保存；不阻塞改稿）
+  restoring: false, // 恢复用的 GET /api/archive 在途
+  archiveError: null, // 最近一次存档操作失败的错误信息（数组）
+  archiveConflict: null, // 最近一次 409 冲突时服务端的当前版本（数字）；读取最新版本或保存 / 恢复成功后清空
+  archiveNotice: null, // 存档提示（如"已读取最新版本 v3"、"服务端暂无存档"）
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -81,6 +88,11 @@ const excerptBanner = $("#excerpt-banner");
 const excerptBody = $("#excerpt-body");
 const statCount = $("#stat-count");
 const statBroken = $("#stat-broken");
+const archiveStatus = $("#archive-status");
+const archiveSaveBtn = $("#archive-save-btn");
+const archiveRestoreBtn = $("#archive-restore-btn");
+const archiveRestoreImportBtn = $("#archive-restore-import-btn");
+const archiveBanner = $("#archive-banner");
 
 // --------------------------------------------------------------------------- //
 // 工具
@@ -93,12 +105,13 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
-async function api(path, body) {
-  const res = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+async function api(path, body, method) {
+  const opts = { method: method || "POST" };
+  if (body !== undefined && body !== null) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
   // 正文可能在读取/解析时中断（已收到 2xx 响应头但正文被截断）：
   // 这种响应不能当作成功采用，统一归为可重试的请求失败，由各调用方按失败收尾。
   let data;
@@ -110,6 +123,7 @@ async function api(path, body) {
   if (!res.ok) {
     const err = new Error("api error");
     err.status = res.status;
+    err.detail = data && data.detail; // 如 409 冲突时附带的当前版本
     err.errors = (data && data.detail && data.detail.errors) || ["请求失败"];
     throw err;
   }
@@ -155,6 +169,10 @@ function snapshotBaseline() {
 function touch() {
   state.rev += 1;
   state.previewFresh = false;
+  // 任何改稿都使服务端存档落后于草稿：提示有未存档的修改，直到保存成功或恢复；
+  // 旧的存档提示（如"已读取最新版本"）同时过时，一并清掉（错误与冲突保留）
+  state.archiveDirty = true;
+  state.archiveNotice = null;
   // 改稿后旧对照立即失效：已展示的对照内容立即标记过期，等待新草稿的对照响应；
   // 取消编辑 / 保存失败不经过 touch()，因此不会让对照失效。
   state.diffFresh = false;
@@ -178,6 +196,7 @@ function syncToolbar() {
   updateDuplicateBtn();
   updateExcerptBtn();
   updateDownloadBtn();
+  syncArchiveUi();
   syncBusy();
 }
 
@@ -309,6 +328,289 @@ function updateExcerptBtn() {
 }
 
 // --------------------------------------------------------------------------- //
+// 校稿存档（共享槽完整快照：基线 + 当前顺序 + 内部正文 + 已用身份上界）
+// --------------------------------------------------------------------------- //
+// 存档快照只含可持久化的草稿内容，不含勾选、编辑中正文或拆分选择等临时状态。
+function archiveSnapshot() {
+  return {
+    baseline: snapshotBaseline(),
+    order_ids: state.orderIds.slice(),
+    clauses: state.clauses.map((c) => ({ id: c.id, body: c.body })),
+    id_counter: state.idCounter,
+  };
+}
+
+// 存档状态文本、两个入口按钮与横幅的统一同步（经 syncToolbar 随草稿状态刷新）
+function syncArchiveUi() {
+  if (state.archiveDirty) {
+    archiveStatus.textContent =
+      state.archiveVersion === null ? "尚未保存存档" : "有未存档的修改";
+  } else if (state.archiveVersion !== null) {
+    archiveStatus.textContent = `已存档（版本 ${state.archiveVersion}）`;
+  } else {
+    archiveStatus.textContent = "";
+  }
+
+  archiveSaveBtn.disabled = state.archiving || state.restoring;
+  archiveSaveBtn.textContent = state.archiving ? "存档中…" : "保存存档";
+  // 恢复会整份替换草稿：未保存编辑、拆分选择或写稿未结束时不可恢复
+  const restoreBlocked =
+    state.editingId !== null || state.splittingId !== null || state.writing !== null;
+  archiveRestoreBtn.disabled = state.archiving || state.restoring || restoreBlocked;
+  archiveRestoreBtn.textContent = state.restoring ? "恢复中…" : "恢复存档";
+  archiveRestoreBtn.title = restoreBlocked
+    ? "未保存编辑、拆分选择或写稿未结束时不可恢复"
+    : "读取服务端存档，确认后整份替换当前草稿";
+  archiveRestoreImportBtn.disabled = state.restoring;
+  archiveRestoreImportBtn.textContent = state.restoring ? "恢复中…" : "恢复存档";
+  syncArchiveBanner();
+}
+
+function syncArchiveBanner() {
+  if (state.archiveConflict !== null) {
+    // 冲突：本地稿保留，不自动覆盖；提供「读取最新版本」入口
+    archiveBanner.innerHTML =
+      `<strong>存档冲突。</strong>服务端存档已更新到版本 ${state.archiveConflict}，本次保存未写入；` +
+      `本地草稿已保留，不会自动覆盖服务端存档。` +
+      `<div class="preview-error-actions">` +
+      `<button type="button" class="primary" data-action="archive-read-latest">读取最新版本</button>` +
+      `<span class="muted">读取后可再次保存（将覆盖服务端该版本存档），或点「恢复存档」用服务端存档替换本地稿。</span>` +
+      `</div>`;
+    archiveBanner.hidden = false;
+    return;
+  }
+  if (state.archiveError) {
+    archiveBanner.innerHTML =
+      `<strong>存档操作失败。</strong>草稿未受影响：` +
+      `<ul>${state.archiveError.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>`;
+    archiveBanner.hidden = false;
+    return;
+  }
+  if (state.archiveNotice) {
+    archiveBanner.textContent = state.archiveNotice;
+    archiveBanner.hidden = false;
+    return;
+  }
+  archiveBanner.hidden = true;
+  archiveBanner.textContent = "";
+}
+
+// 保存存档：携带最近读取或保存成功得到的版本整份写入；保存期间可继续改稿，
+// 回执只确认提交时的快照——期间又有修改的，仍提示未存档。
+archiveSaveBtn.addEventListener("click", async () => {
+  if (state.archiving || state.restoring) return; // 忽略等待期间的重复提交
+  // 首次保存前尚未读取过版本：先读取拿到槽内当前版本（空槽为 0），再据此保存
+  if (state.archiveVersion === null) {
+    state.archiving = true;
+    syncArchiveUi();
+    try {
+      const data = await api("/api/archive", null, "GET");
+      if (typeof data.version !== "number") throw new Error("bad archive read");
+      state.archiveVersion = data.version;
+    } catch (e) {
+      state.archiving = false;
+      state.archiveError = errorList(e);
+      syncArchiveUi();
+      return;
+    }
+    state.archiving = false;
+  }
+  const epoch = state.epoch;
+  const rev = state.rev;
+  const version = state.archiveVersion;
+  const snapshot = archiveSnapshot(); // 提交当刻的快照；之后的修改不影响已发出的请求
+  state.archiving = true;
+  state.archiveError = null;
+  syncArchiveUi();
+  try {
+    const data = await api("/api/archive", { version, snapshot }, "PUT");
+    if (epoch !== state.epoch) return; // 已重新导入 / 已恢复：旧回执不作用于新稿
+    if (typeof data.version !== "number") {
+      state.archiveError = ["存档响应正文不完整，请重试。"];
+      return;
+    }
+    // 服务端版本确已推进：无论草稿是否又改，都更新版本知识
+    state.archiveVersion = data.version;
+    state.archiveConflict = null;
+    state.archiveError = null;
+    if (rev === state.rev) {
+      state.archiveDirty = false;
+      state.archiveNotice = null;
+    } else {
+      // 回执只确认提交时的快照；保存期间的后续修改仍属未存档
+      state.archiveNotice = `已保存提交时的快照（版本 ${data.version}）；此后草稿又有修改，仍需再次保存。`;
+    }
+  } catch (e) {
+    if (epoch !== state.epoch) return; // 旧请求的失败不在新稿上提示
+    if (e.status === 409) {
+      // 冲突：保留本地稿，提示读取最新版本，不自动覆盖
+      const current = e.detail && typeof e.detail.version === "number" ? e.detail.version : null;
+      if (current === null) state.archiveError = errorList(e);
+      else state.archiveConflict = current;
+    } else {
+      state.archiveError = errorList(e);
+    }
+  } finally {
+    if (epoch === state.epoch) {
+      state.archiving = false;
+      syncArchiveUi();
+    }
+  }
+});
+
+// 冲突横幅上的「读取最新版本」：只读取版本与提示，不覆盖本地稿、不自动恢复
+archiveBanner.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest('[data-action="archive-read-latest"]');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const data = await api("/api/archive", null, "GET");
+    if (typeof data.version !== "number") throw new Error("bad archive read");
+    state.archiveVersion = data.version;
+    state.archiveConflict = null;
+    state.archiveError = null;
+    state.archiveNotice = data.snapshot
+      ? `已读取最新版本（版本 ${data.version}）。再次点「保存存档」将覆盖服务端该版本存档；` +
+        `或点「恢复存档」用服务端存档替换本地稿。`
+      : "服务端存档当前为空，可直接保存当前草稿。";
+  } catch (e) {
+    state.archiveError = errorList(e);
+  }
+  syncArchiveUi();
+});
+
+// 恢复存档：先读取最新版本，确认后整份安装。两个入口（工具栏 / 导入面板）共用。
+async function restoreArchive() {
+  if (state.archiving || state.restoring) return;
+  // 未保存编辑、拆分选择或写稿未结束时不可恢复（按钮已禁用，这里兜底）
+  if (state.editingId !== null || state.splittingId !== null || state.writing !== null) return;
+  const epoch = state.epoch;
+  state.restoring = true;
+  state.archiveError = null;
+  syncArchiveUi();
+  let data;
+  try {
+    data = await api("/api/archive", null, "GET");
+  } catch (e) {
+    if (epoch !== state.epoch) return; // 已重新导入 / 已恢复：旧读取的失败不在新稿上提示
+    state.restoring = false;
+    state.archiveError = errorList(e);
+    syncArchiveUi();
+    return;
+  }
+  if (epoch !== state.epoch) return; // 等待期间已重新导入 / 已恢复：旧读取结果不再作用
+  state.restoring = false;
+  if (typeof data.version !== "number") {
+    state.archiveError = ["存档响应正文不完整，请重试。"];
+    syncArchiveUi();
+    return;
+  }
+  state.archiveVersion = data.version; // 版本知识无论是否恢复都更新
+  if (state.archiveConflict !== null) {
+    // 此前的冲突随本次读取解除：再保存将覆盖服务端该版本存档
+    state.archiveConflict = null;
+    state.archiveNotice = `已读取最新版本（版本 ${data.version}）。`;
+  }
+  if (!data.snapshot) {
+    state.archiveNotice = "服务端暂无存档可恢复。";
+    syncArchiveUi();
+    return;
+  }
+  if (!validArchiveSnapshot(data.snapshot)) {
+    state.archiveError = ["存档内容损坏，无法恢复。"];
+    syncArchiveUi();
+    return;
+  }
+  // 恢复须确认：整份替换当前草稿，未保存的修改将丢失
+  const ok = confirm(
+    `将用服务端存档（版本 ${data.version}）替换当前草稿：\n` +
+      `原稿基线、当前顺序、正文与身份上界全部恢复为存档内容，未存档的修改将丢失。\n确定恢复？`,
+  );
+  if (!ok) {
+    syncArchiveUi();
+    return;
+  }
+  installArchive(data.snapshot, data.version);
+}
+
+// 存档快照的基本结构检查（写入前服务端已校验，这里仅防御损坏数据）
+function validArchiveSnapshot(snap) {
+  return (
+    snap &&
+    typeof snap === "object" &&
+    Array.isArray(snap.order_ids) &&
+    Array.isArray(snap.clauses) &&
+    snap.baseline &&
+    Array.isArray(snap.baseline.order_ids) &&
+    Array.isArray(snap.baseline.clauses) &&
+    Number.isInteger(snap.id_counter)
+  );
+}
+
+// 整份安装存档：基线、当前顺序、内部正文与已用身份上界一起替换（含失效引用，
+// 上界保证继续拆分 / 复制不复用旧身份）；世代推进隔离旧请求，随后重算预览与对照。
+function installArchive(snap, version) {
+  // 世代 +1 并推进各请求序号：恢复前的一切在途请求（预览 / 保存 / 写稿 / 下载 /
+  // 对照 / 引用 / 摘录）的迟到响应一律作废，不作用于恢复后的草稿
+  state.epoch += 1;
+  writeSeq += 1;
+  exportSeq += 1;
+  diffSeq += 1;
+  refsSeq += 1;
+  previewInFlight = false;
+  diffInFlight = false;
+  refsInFlight = false;
+  state.baseline = {
+    order_ids: snap.baseline.order_ids.slice(),
+    clauses: snap.baseline.clauses.map((c) => ({ id: c.id, body: c.body })),
+  };
+  state.orderIds = snap.order_ids.slice();
+  state.clauses = snap.clauses.map((c) => ({
+    id: c.id,
+    original: parseInt(c.id.slice(1), 10),
+    body: c.body,
+  }));
+  state.idCounter = snap.id_counter;
+  // 临时选择一律不恢复：编辑 / 拆分选择 / 勾选 / 写稿与下载状态清空
+  state.editingId = null;
+  state.splittingId = null;
+  state.splitOffset = null;
+  state.splitRefsTo = "front";
+  state.pickIds = [];
+  state.writing = null;
+  state.saving = false;
+  state.exporting = false;
+  state.preview = null;
+  state.previewError = null;
+  state.renderedRev = null;
+  state.renderedSplittingId = null;
+  state.renderedEditingId = null;
+  state.refsId = null;
+  state.refsData = null;
+  state.refsError = null;
+  state.refsFresh = false;
+  clearExcerpt();
+  state.diffData = null;
+  state.diffError = null;
+  state.diffFresh = false;
+  // 存档状态：恢复稿与服务端存档一致
+  state.archiveVersion = version;
+  state.archiveConflict = null;
+  state.archiveError = null;
+  state.archiveNotice = null;
+  // 进入校稿台并重算预览与对照；预览失败保留恢复稿、可重试，
+  // 预览恢复前禁止旧编号跳转与下载（既有失败横幅机制）
+  importPanel.hidden = true;
+  desk.hidden = false;
+  touch(); // rev+1、预览与对照标记过期并自动重算
+  state.archiveDirty = false; // touch 会标未存档；恢复稿与存档一致，复位
+  render();
+}
+
+archiveRestoreBtn.addEventListener("click", restoreArchive);
+archiveRestoreImportBtn.addEventListener("click", restoreArchive);
+
+// --------------------------------------------------------------------------- //
 // 导入
 // --------------------------------------------------------------------------- //
 const SAMPLE = [
@@ -367,6 +669,11 @@ importBtn.addEventListener("click", async () => {
     state.renderedRev = null;
     state.renderedSplittingId = null;
     state.renderedEditingId = null;
+    // 新草稿的存档交互重新开始：保留服务端版本知识（仍有效），清掉旧提示；
+    // touch() 会把新稿标记为未存档
+    state.archiveError = null;
+    state.archiveConflict = null;
+    state.archiveNotice = null;
     state.epoch += 1; // 新草稿世代：上一草稿的在途请求全部作废
     previewInFlight = false;
     touch();
@@ -424,6 +731,13 @@ $("#reimport-btn").addEventListener("click", () => {
   state.rev += 1;
   state.saving = false;
   state.writing = null;
+  // 存档状态：新草稿未存档；在途存档请求的响应因世代不符被丢弃，这里复位在途态
+  state.archiveDirty = true;
+  state.archiveError = null;
+  state.archiveConflict = null;
+  state.archiveNotice = null;
+  state.archiving = false;
+  state.restoring = false;
   writeSeq += 1; // 作废旧写稿请求：其成功 / 失败 / 收尾不得改新稿或解除新请求的等待状态
   state.exporting = false;
   exportSeq += 1; // 作废旧下载对等待状态的收尾权：其成功或失败都不得解锁新草稿的下载按钮

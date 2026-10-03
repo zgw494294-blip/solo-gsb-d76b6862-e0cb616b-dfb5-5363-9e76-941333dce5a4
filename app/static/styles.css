@@ -410,3 +410,13 @@ button.danger:hover:not(:disabled) { background: var(--danger-bg); }
 
 .excerpt-text { min-height: 0; max-height: 320px; margin-bottom: 12px; }
 .excerpt-actions { display: flex; gap: 10px; }
+
+/* --------------------------------------------------------------------------- */
+/* 校稿存档（工具栏状态 + 冲突 / 失败 / 提示横幅） */
+/* --------------------------------------------------------------------------- */
+.archive-status { white-space: nowrap; }
+.archive-hint { margin-top: 10px; }
+
+.archive-banner { font-size: 13.5px; }
+.archive-banner ul { margin: 8px 0 0; padding-left: 20px; }
+.archive-banner .preview-error-actions { align-items: center; }

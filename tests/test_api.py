@@ -1293,3 +1293,149 @@ def test_excerpt_does_not_modify_draft():
     # 只读接口：草稿、顺序与引用绑定均不被改动
     assert payload == {**state, "selected_ids": ["c3"]}
 
+
+# --------------------------------------------------------------------------- #
+# 校稿存档 /api/archive
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _isolated_archive_db(tmp_path, monkeypatch):
+    """每个测试使用独立的临时存档数据库，互不干扰（不改生产默认路径）。"""
+    monkeypatch.setattr("app.main.DB_PATH", tmp_path / "archive.db")
+
+
+def _archive_snapshot(order, bodies, id_counter=4, baseline=None):
+    return {
+        "baseline": baseline or {"order_ids": list(order), "clauses": bodies},
+        "order_ids": list(order),
+        "clauses": bodies,
+        "id_counter": id_counter,
+    }
+
+
+def test_archive_empty_slot_reads_version_zero():
+    r = client.get("/api/archive")
+    assert r.status_code == 200
+    assert r.json() == {"version": 0, "snapshot": None}
+
+
+def test_archive_save_then_read_roundtrip_and_version_bumps():
+    bodies = _bodies(import_text(GOOD).json())
+    snap = _archive_snapshot(ids4(), bodies)
+    # 空槽保存：携带版本 0，整份写入后版本加 1
+    r = client.put("/api/archive", json={"version": 0, "snapshot": snap})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"version": 1}
+    # 读取返回版本与完整快照（基线、顺序、内部正文与身份上界一致）
+    r = client.get("/api/archive")
+    assert r.status_code == 200
+    assert r.json() == {"version": 1, "snapshot": snap}
+    # 携带最近保存得到的版本再次保存：整份写入并再加 1
+    snap2 = _archive_snapshot(["c4", "c1", "c2", "c3"], bodies)
+    r = client.put("/api/archive", json={"version": 1, "snapshot": snap2})
+    assert r.status_code == 200
+    assert r.json() == {"version": 2}
+    r = client.get("/api/archive")
+    assert r.json()["version"] == 2
+    assert r.json()["snapshot"]["order_ids"] == ["c4", "c1", "c2", "c3"]
+
+
+def test_archive_conflict_returns_409_and_keeps_old_snapshot():
+    bodies = _bodies(import_text(GOOD).json())
+    snap = _archive_snapshot(ids4(), bodies)
+    assert client.put("/api/archive", json={"version": 0, "snapshot": snap}).status_code == 200
+    # 基于过期版本保存：409 并附服务端当前版本，旧存档保留
+    snap2 = _archive_snapshot(["c4", "c1", "c2", "c3"], bodies)
+    r = client.put("/api/archive", json={"version": 0, "snapshot": snap2})
+    assert r.status_code == 409
+    assert r.json()["detail"]["version"] == 1
+    assert r.json()["detail"]["errors"]
+    r = client.get("/api/archive")
+    assert r.json()["version"] == 1
+    assert r.json()["snapshot"]["order_ids"] == ids4()
+    # 携带读取到的最新版本再保存：成功推进
+    r = client.put("/api/archive", json={"version": 1, "snapshot": snap2})
+    assert r.status_code == 200
+    assert r.json() == {"version": 2}
+
+
+def test_archive_rejects_invalid_snapshot_and_keeps_old():
+    bodies = _bodies(import_text(GOOD).json())
+    snap = _archive_snapshot(ids4(), bodies)
+    assert client.put("/api/archive", json={"version": 0, "snapshot": snap}).status_code == 200
+    # 现稿损坏：顺序列表与条款集合不一致（沿用草稿校验）
+    bad = _archive_snapshot(["c1", "c2"], bodies)
+    r = client.put("/api/archive", json={"version": 1, "snapshot": bad})
+    assert r.status_code == 422
+    # 基线损坏：内部引用形态非法
+    bad_base = _archive_snapshot(
+        ids4(),
+        bodies,
+        baseline={
+            "order_ids": ids4(),
+            "clauses": [
+                {"id": b["id"], "body": b["body"].replace("[[c1]]", "[[1]]") if b["id"] == "c2" else b["body"]}
+                for b in bodies
+            ],
+        },
+    )
+    r = client.put("/api/archive", json={"version": 1, "snapshot": bad_base})
+    assert r.status_code == 422
+    # 非法版本号
+    r = client.put("/api/archive", json={"version": -1, "snapshot": snap})
+    assert r.status_code == 422
+    # 非法快照与非法版本均未写入：旧存档保留
+    r = client.get("/api/archive")
+    assert r.json() == {"version": 1, "snapshot": snap}
+
+
+def test_archive_id_counter_must_cover_baseline_current_and_broken_ref_ids():
+    doc = import_text(GOOD).json()
+    bodies = _bodies(doc)
+    # 现稿删除 c4（c3 正文含失效引用 [[c4]]），基线仍是完整四条：上界须覆盖到 4
+    cur_order = ["c1", "c2", "c3"]
+    cur_bodies = [b for b in bodies if b["id"] != "c4"]
+    snap = _archive_snapshot(
+        cur_order,
+        cur_bodies,
+        id_counter=3,
+        baseline={"order_ids": ids4(), "clauses": bodies},
+    )
+    r = client.put("/api/archive", json={"version": 0, "snapshot": snap})
+    assert r.status_code == 422
+    assert "上界" in r.json()["detail"]["errors"][0]
+    assert client.get("/api/archive").json() == {"version": 0, "snapshot": None}
+    # 上界覆盖后保存成功：失效引用与身份上界随快照保留，恢复后旧身份不复用
+    snap["id_counter"] = 4
+    r = client.put("/api/archive", json={"version": 0, "snapshot": snap})
+    assert r.status_code == 200
+    got = client.get("/api/archive").json()["snapshot"]
+    assert got["id_counter"] == 4
+    assert got["clauses"][2]["body"] == "争议解决见 [[c4]]，违约参照 [[c2]]"
+    # 恢复出的快照可直接用于既有接口：失效引用如实呈现、导出仍 409
+    r = client.post("/api/preview", json={"order_ids": got["order_ids"], "clauses": got["clauses"]})
+    assert r.json()["has_broken"] is True
+    r = client.post("/api/export", json={"order_ids": got["order_ids"], "clauses": got["clauses"]})
+    assert r.status_code == 409
+    # 拆分新身份须高于恢复的上界：复用旧身份（c4）被拒，c5 成功
+    r = _split(got["order_ids"], got["clauses"], "c2", 2, "c4")
+    assert r.status_code == 422
+    r = _split(got["order_ids"], got["clauses"], "c2", 2, "c5")
+    assert r.status_code == 200
+
+
+def test_archive_snapshot_with_advanced_counter_roundtrips():
+    bodies = _bodies(import_text(GOOD).json())
+    # 复制推进上界到 5 后保存：快照保留新身份与上界
+    r = _dup(ids4(), bodies, ["c1"], 4)
+    assert r.status_code == 200
+    data = r.json()
+    snap = _archive_snapshot(data["order_ids"], data["clauses"], id_counter=data["next_id"])
+    r = client.put("/api/archive", json={"version": 0, "snapshot": snap})
+    assert r.status_code == 200
+    got = client.get("/api/archive").json()["snapshot"]
+    assert got == snap
+    # 上界低于现稿身份（c5）时拒绝
+    snap_low = _archive_snapshot(data["order_ids"], data["clauses"], id_counter=4)
+    r = client.put("/api/archive", json={"version": 1, "snapshot": snap_low})
+    assert r.status_code == 422
+

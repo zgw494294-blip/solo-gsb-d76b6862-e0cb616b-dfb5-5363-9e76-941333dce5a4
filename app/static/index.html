@@ -25,7 +25,9 @@
       <div class="row">
         <button id="import-btn" class="primary">导入</button>
         <button id="sample-btn" type="button">填入示例</button>
+        <button id="archive-restore-import-btn" type="button" title="读取服务端存档并恢复校稿">恢复存档</button>
       </div>
+      <p class="hint archive-hint">如之前点过「保存存档」，可点「恢复存档」直接恢复基线、顺序、正文与身份上界，继续校订。</p>
       <ul id="import-errors" class="errors" hidden></ul>
     </section>
 
@@ -35,9 +37,11 @@
         <div class="toolbar-left">
           <strong id="stat-count"></strong>
           <span id="stat-broken" class="broken-pill" hidden></span>
-          <span class="muted">（刷新页面将丢弃草稿）</span>
+          <span id="archive-status" class="archive-status muted"></span>
         </div>
         <div class="toolbar-right">
+          <button id="archive-save-btn" title="把基线、当前顺序、正文与身份上界整份保存到服务端存档">保存存档</button>
+          <button id="archive-restore-btn">恢复存档</button>
           <button id="merge-btn" disabled>合并所选</button>
           <button id="duplicate-btn" disabled>复制所选</button>
           <button id="excerpt-btn" disabled>导出摘录</button>
@@ -46,6 +50,9 @@
           <button id="download-btn" class="primary" disabled>下载纯文本</button>
         </div>
       </div>
+
+      <!-- 存档横幅：冲突提示（含「读取最新版本」入口）、操作失败原因与一般提示 -->
+      <div id="archive-banner" class="panel banner archive-banner" hidden></div>
 
       <div id="broken-banner" class="panel banner" hidden></div>
 
