@@ -38,6 +38,9 @@ const state = {
   excerptData: null, // 最近一次与当前草稿+勾选一致的 /api/excerpt 响应；改稿 / 切换勾选 / 重新导入立即置空
   excerptError: null, // 最近一次摘录导出失败的错误信息（数组）；成功一次或清空后复位
   excerpting: false, // /api/excerpt 在途（期间忽略重复提交）
+  archiveVersion: null, // 最近一次从服务器读到 / 保存成功的存档版本；null 表示尚未读取过
+  archiveSavedRev: -1, // 已存档快照对应的草稿修订号；与 state.rev 不等即有未存档修改
+  archiving: null, // 存档读写在途（null | "save" | "restore"）：期间两个存档按钮都禁用
 };
 
 const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超过它
@@ -79,6 +82,9 @@ const excerptPanel = $("#excerpt-panel");
 const excerptStatus = $("#excerpt-status");
 const excerptBanner = $("#excerpt-banner");
 const excerptBody = $("#excerpt-body");
+const archiveSaveBtn = $("#archive-save-btn");
+const archiveRestoreBtn = $("#archive-restore-btn");
+const archiveStatus = $("#archive-status");
 const statCount = $("#stat-count");
 const statBroken = $("#stat-broken");
 
@@ -93,12 +99,13 @@ function esc(s) {
     .replace(/"/g, "&quot;");
 }
 
-async function api(path, body) {
-  const res = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+async function api(path, body, method = "POST") {
+  const init = { method, headers: {} };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, init);
   // 正文可能在读取/解析时中断（已收到 2xx 响应头但正文被截断）：
   // 这种响应不能当作成功采用，统一归为可重试的请求失败，由各调用方按失败收尾。
   let data;
@@ -111,6 +118,7 @@ async function api(path, body) {
     const err = new Error("api error");
     err.status = res.status;
     err.errors = (data && data.detail && data.detail.errors) || ["请求失败"];
+    err.detail = data && data.detail; // 结构化细节（如存档冲突时的服务器当前版本）
     throw err;
   }
   if (data === null || typeof data !== "object") {
@@ -178,6 +186,7 @@ function syncToolbar() {
   updateDuplicateBtn();
   updateExcerptBtn();
   updateDownloadBtn();
+  syncArchive();
   syncBusy();
 }
 
@@ -1748,6 +1757,163 @@ excerptPanel.addEventListener("click", (ev) => {
     URL.revokeObjectURL(url);
   }
 });
+
+// --------------------------------------------------------------------------- //
+// 校稿存档（服务器单共享槽：刷新页面或重建容器后可恢复继续校订）
+// --------------------------------------------------------------------------- //
+// 快照只含原稿基线、当前顺序、内部正文（含失效引用标记）与已用身份上界；
+// 勾选、编辑中内容、拆分选择等临时状态一律不入档。
+// 版本约定：保存携带最近读取或保存成功得到的版本，仅匹配时整份写入并 +1；
+// 冲突（409）保留本地稿、不自动覆盖，提示读取最新版本。
+function syncArchive() {
+  const busy = state.archiving !== null;
+  archiveSaveBtn.disabled = busy;
+  archiveSaveBtn.textContent = state.archiving === "save" ? "存档中…" : "保存存档";
+  // 未保存编辑、拆分选择或写稿未结束时不可恢复（恢复会整份替换草稿）
+  const blocked = state.editingId !== null || state.splittingId !== null || state.writing !== null;
+  archiveRestoreBtn.disabled = busy || blocked;
+  archiveRestoreBtn.textContent = state.archiving === "restore" ? "恢复中…" : "恢复存档";
+  archiveRestoreBtn.title = blocked
+    ? "未保存编辑、拆分选择或写稿未结束时不可恢复"
+    : "读取服务器最新存档并整份替换当前草稿（需确认）";
+  // 回执只确认提交那一刻的快照：之后又有改稿时 rev 已变，仍提示未存档
+  archiveStatus.textContent =
+    state.archiveSavedRev === state.rev
+      ? `已存档（版本 ${state.archiveVersion}）`
+      : "有未存档修改";
+}
+
+archiveSaveBtn.addEventListener("click", async () => {
+  if (state.archiving || !state.baseline) return; // 在途时忽略重复提交
+  state.archiving = "save";
+  syncArchive();
+  try {
+    // 保存携带最近读取或保存成功得到的版本；尚未读取过时先读一次共享槽版本
+    if (state.archiveVersion === null) {
+      const cur = await api("/api/archive", undefined, "GET");
+      state.archiveVersion = cur.version;
+    }
+    // 取快照与记录修订号是同步的：回执确认的正是这一刻的完整快照
+    const snap = {
+      baseline: snapshotBaseline(),
+      current: snapshot(),
+      next_id: state.idCounter,
+    };
+    const revAtSubmit = state.rev;
+    const res = await api("/api/archive", { version: state.archiveVersion, snapshot: snap }, "PUT");
+    state.archiveVersion = res.version;
+    state.archiveSavedRev = revAtSubmit; // 保存期间又有改稿时 rev 已变，状态区仍提示未存档
+  } catch (e) {
+    if (e.status === 409) {
+      // 冲突：本地草稿保留、服务器存档未被覆盖；提示读取最新版本，不自动覆盖
+      const v = e.detail && typeof e.detail.version === "number" ? e.detail.version : null;
+      alert(
+        "存档冲突：服务器上的存档已被更新" +
+          (v === null ? "" : `（当前版本 ${v}）`) +
+          "。\n本地草稿已保留，服务器存档未被覆盖。\n" +
+          "如需以服务器存档为准，请点「恢复存档」读取最新版本（将整份替换当前草稿）。",
+      );
+    } else {
+      alert("存档保存失败，服务器存档未改动：\n" + errorList(e).join("\n"));
+    }
+  } finally {
+    state.archiving = null;
+    syncArchive();
+  }
+});
+
+archiveRestoreBtn.addEventListener("click", async () => {
+  // 未保存编辑、拆分选择或写稿未结束时不可恢复（按钮已禁用，这里兜底）
+  if (state.archiving || state.editingId || state.splittingId || state.writing) return;
+  state.archiving = "restore";
+  syncArchive();
+  try {
+    const data = await api("/api/archive", undefined, "GET");
+    if (
+      !data ||
+      typeof data.version !== "number" ||
+      (data.version > 0 &&
+        (!data.snapshot ||
+          !data.snapshot.baseline ||
+          !data.snapshot.current ||
+          typeof data.snapshot.next_id !== "number"))
+    ) {
+      alert("存档响应不完整，请重试。");
+      return;
+    }
+    if (data.version === 0 || !data.snapshot) {
+      alert("服务器上还没有校稿存档。");
+      return;
+    }
+    const dirty = state.archiveSavedRev !== state.rev;
+    const msg =
+      `将用服务器存档（版本 ${data.version}）整份替换当前草稿：\n` +
+      "原稿基线、条款顺序、正文与身份上界都会被存档内容取代" +
+      (dirty ? "，当前未存档的修改将丢失" : "") +
+      "。\n确定恢复？";
+    if (!confirm(msg)) return; // 恢复须确认替换
+    installArchive(data.snapshot, data.version);
+  } catch (e) {
+    alert("存档恢复失败：\n" + errorList(e).join("\n"));
+  } finally {
+    state.archiving = null;
+    syncArchive();
+  }
+});
+
+// 整份安装存档快照：世代推进隔离全部旧请求（在途响应一律落空），临时选择一律清空；
+// 失效引用与身份上界随快照保留——继续拆分 / 复制不会复用旧身份、不会复活失效引用。
+// 随后重算预览与对照；预览失败保留恢复稿并可重试，预览恢复前禁止旧编号跳转与下载。
+function installArchive(snap, version) {
+  state.epoch += 1; // 旧请求（预览 / 保存 / 写稿 / 下载 / 对照 / 引用 / 摘录）的迟到响应一律丢弃
+  writeSeq += 1;
+  exportSeq += 1;
+  diffSeq += 1;
+  refsSeq += 1;
+  previewInFlight = false;
+  diffInFlight = false;
+  refsInFlight = false;
+
+  state.baseline = {
+    order_ids: snap.baseline.order_ids.slice(),
+    clauses: snap.baseline.clauses.map((c) => ({ id: c.id, body: c.body })),
+  };
+  state.orderIds = snap.current.order_ids.slice();
+  state.clauses = snap.current.clauses.map((c) => ({
+    id: c.id,
+    original: parseInt(c.id.slice(1), 10),
+    body: c.body,
+  }));
+  state.idCounter = snap.next_id;
+
+  // 临时状态清空（快照本就不含这些）
+  state.editingId = null;
+  state.pickIds = [];
+  state.splittingId = null;
+  state.splitOffset = null;
+  state.splitRefsTo = "front";
+  state.writing = null;
+  state.saving = false;
+  state.exporting = false;
+  state.preview = null;
+  state.previewError = null;
+  state.renderedRev = null;
+  state.renderedSplittingId = null;
+  state.renderedEditingId = null;
+  state.refsId = null;
+  state.refsData = null;
+  state.refsError = null;
+  state.refsFresh = false;
+  clearExcerpt();
+  state.diffData = null;
+  state.diffError = null;
+  state.diffFresh = false;
+
+  state.archiveVersion = version;
+  touch(); // 重算预览（render 在下方触发）；对照面板展开时自动按新基线重算
+  state.archiveSavedRev = state.rev; // 刚安装的稿子与存档一致
+  render();
+}
 
 // --------------------------------------------------------------------------- //
 // 下载（以服务端 /api/export 为准，保证与预览一致）

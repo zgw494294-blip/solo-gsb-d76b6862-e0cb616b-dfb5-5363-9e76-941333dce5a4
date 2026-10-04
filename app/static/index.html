@@ -35,9 +35,11 @@
         <div class="toolbar-left">
           <strong id="stat-count"></strong>
           <span id="stat-broken" class="broken-pill" hidden></span>
-          <span class="muted">（刷新页面将丢弃草稿）</span>
+          <span id="archive-status" class="muted" title="存档保存在服务器共享槽中，刷新页面或重建容器后可恢复"></span>
         </div>
         <div class="toolbar-right">
+          <button id="archive-save-btn" title="把原稿基线、当前顺序、正文与身份上界整份存入服务器共享槽">保存存档</button>
+          <button id="archive-restore-btn" title="读取服务器最新存档并整份替换当前草稿（需确认）">恢复存档</button>
           <button id="merge-btn" disabled>合并所选</button>
           <button id="duplicate-btn" disabled>复制所选</button>
           <button id="excerpt-btn" disabled>导出摘录</button>

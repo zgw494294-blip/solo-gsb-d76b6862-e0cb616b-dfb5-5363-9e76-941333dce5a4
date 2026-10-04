@@ -1293,3 +1293,128 @@ def test_excerpt_does_not_modify_draft():
     # 只读接口：草稿、顺序与引用绑定均不被改动
     assert payload == {**state, "selected_ids": ["c3"]}
 
+
+# --------------------------------------------------------------------------- #
+# 校稿存档 /api/archive（单共享槽，SQLite 持久化）
+# --------------------------------------------------------------------------- #
+import app.main as main
+
+
+@pytest.fixture
+def archive_db(tmp_path, monkeypatch):
+    """每个存档测试使用独立的临时数据库文件（首次访问时自动建库建表）。"""
+    monkeypatch.setattr(main, "ARCHIVE_DB_PATH", str(tmp_path / "archive.db"))
+    return tmp_path / "archive.db"
+
+
+def _archive_snapshot(order, clauses, next_id, baseline=None):
+    doc = {"order_ids": order, "clauses": clauses}
+    return {"baseline": baseline or doc, "current": doc, "next_id": next_id}
+
+
+def test_archive_empty_slot_reads_version_zero(archive_db):
+    r = client.get("/api/archive")
+    assert r.status_code == 200
+    assert r.json() == {"version": 0, "snapshot": None}
+
+
+def test_archive_db_auto_created_in_missing_dir(tmp_path, monkeypatch):
+    # 目录不存在时自动建库
+    monkeypatch.setattr(main, "ARCHIVE_DB_PATH", str(tmp_path / "sub" / "dir" / "archive.db"))
+    r = client.get("/api/archive")
+    assert r.status_code == 200
+    assert r.json()["version"] == 0
+
+
+def test_archive_save_and_read_roundtrip(archive_db):
+    bodies = _bodies(import_text(GOOD).json())
+    snap = _archive_snapshot(ids4(), bodies, 4)
+    # 空槽首次保存携带版本 0：整份写入并 +1
+    r = client.put("/api/archive", json={"version": 0, "snapshot": snap})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"version": 1}
+    # 读回：版本与完整快照一致
+    r = client.get("/api/archive")
+    assert r.status_code == 200
+    assert r.json() == {"version": 1, "snapshot": snap}
+    # 携带最近保存成功的版本再保存：整份替换，版本再 +1
+    snap2 = _archive_snapshot(["c1", "c2"], bodies[:2], 4)
+    r = client.put("/api/archive", json={"version": 1, "snapshot": snap2})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"version": 2}
+    r = client.get("/api/archive")
+    assert r.json() == {"version": 2, "snapshot": snap2}
+
+
+def test_archive_version_conflict_returns_409_and_keeps_old(archive_db):
+    bodies = _bodies(import_text(GOOD).json())
+    snap = _archive_snapshot(ids4(), bodies, 4)
+    assert client.put("/api/archive", json={"version": 0, "snapshot": snap}).status_code == 200
+    # 过期版本：409，detail 带服务器当前版本，旧存档保留
+    stale = _archive_snapshot(["c1", "c2"], bodies[:2], 4)
+    r = client.put("/api/archive", json={"version": 0, "snapshot": stale})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["version"] == 1
+    assert detail["errors"]
+    r = client.get("/api/archive")
+    assert r.json() == {"version": 1, "snapshot": snap}
+
+
+def test_archive_invalid_snapshot_rejected_and_old_kept(archive_db):
+    bodies = _bodies(import_text(GOOD).json())
+    good = _archive_snapshot(ids4(), bodies, 4)
+    assert client.put("/api/archive", json={"version": 0, "snapshot": good}).status_code == 200
+    # 草稿结构损坏：顺序列表与条款集合不一致
+    r = client.put("/api/archive", json={"version": 1, "snapshot": _archive_snapshot(["c1"], bodies, 4)})
+    assert r.status_code == 422
+    # 内部引用形态损坏（沿用草稿校验）
+    broken = _archive_snapshot(
+        ids4(), [{**b, "body": b["body"].replace("[[c1]]", "[[1]]")} for b in bodies], 4
+    )
+    r = client.put("/api/archive", json={"version": 1, "snapshot": broken})
+    assert r.status_code == 422
+    # 负版本号
+    r = client.put("/api/archive", json={"version": -1, "snapshot": good})
+    assert r.status_code == 422
+    # 负身份上界
+    r = client.put("/api/archive", json={"version": 1, "snapshot": _archive_snapshot(ids4(), bodies, -1)})
+    assert r.status_code == 422
+    # 旧存档保留
+    r = client.get("/api/archive")
+    assert r.json() == {"version": 1, "snapshot": good}
+
+
+def test_archive_next_id_must_cover_baseline_current_and_broken_ref_ids(archive_db):
+    bodies = _bodies(import_text(GOOD).json())
+    # 现稿删除 c4：c3 中 [[c4]] 成为失效引用；上界仍须覆盖它与基线中的身份号
+    base = {"order_ids": ids4(), "clauses": bodies}
+    cur = {"order_ids": ["c1", "c2", "c3"], "clauses": [b for b in bodies if b["id"] != "c4"]}
+    r = client.put(
+        "/api/archive",
+        json={"version": 0, "snapshot": {"baseline": base, "current": cur, "next_id": 3}},
+    )
+    assert r.status_code == 422
+    assert "上界" in r.json()["detail"]["errors"][0]
+    # 覆盖基线、现稿及失效引用中的身份号：允许写入
+    r = client.put(
+        "/api/archive",
+        json={"version": 0, "snapshot": {"baseline": base, "current": cur, "next_id": 4}},
+    )
+    assert r.status_code == 200, r.text
+    # 恢复后拆分 / 复制从 c5 起取新身份，不会复用 c4 复活失效引用
+    data = client.get("/api/archive").json()
+    assert data["version"] == 1
+    assert data["snapshot"]["next_id"] == 4
+    assert data["snapshot"]["current"] == cur  # 失效引用随档保留
+
+
+def test_archive_snapshot_has_no_transient_selection(archive_db):
+    bodies = _bodies(import_text(GOOD).json())
+    snap = _archive_snapshot(ids4(), bodies, 4)
+    assert client.put("/api/archive", json={"version": 0, "snapshot": snap}).status_code == 200
+    stored = client.get("/api/archive").json()["snapshot"]
+    # 快照只含基线、现稿与身份上界，不含勾选等临时选择
+    assert set(stored) == {"baseline", "current", "next_id"}
+    assert set(stored["current"]) == {"order_ids", "clauses"}
+
